@@ -29,6 +29,11 @@ from schemas import NotFoundError
 
 MAX_JSON_BYTES = 64 * 1024
 MAX_CONCURRENT_OPERATIONS = 8
+DEFAULT_UPLOAD_SIZE_BYTES = 1024 * 1024
+MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("STORAGE_MAX_UPLOAD_SIZE_BYTES", 100 * 1024 * 1024))
+if MAX_UPLOAD_SIZE_BYTES < DEFAULT_UPLOAD_SIZE_BYTES:
+    raise ValueError("STORAGE_MAX_UPLOAD_SIZE_BYTES must be at least 1048576 (1 MiB)")
+
 StorageTarget = Annotated[Union[TargetName, TargetConfig], Field(discriminator="kind")]
 
 
@@ -38,7 +43,7 @@ class StorageRequest(BaseModel):
 
 
 class UploadRequest(StorageRequest):
-    file_size_bytes: PositiveInt = 1024 * 1024
+    file_size_bytes: PositiveInt = Field(default=DEFAULT_UPLOAD_SIZE_BYTES, le=MAX_UPLOAD_SIZE_BYTES)
 
 
 class DownloadRequest(DownloadSpec):
@@ -64,10 +69,12 @@ async def _resolve_target(data, request, config, *, port=None, path="/api/storag
             detail="Storage operations require exactly one pod; narrow the target filters",
         )
     pod = pods[0]
-    pod_ip = pod.pod.status.pod_ip if pod.pod.status else None
-    if not pod_ip:
-        raise HTTPException(status_code=503, detail=f"Pod {pod.pod_name} has no IP")
-    host = f"[{pod_ip}]" if ":" in pod_ip else pod_ip
+    node_address = (
+        pod.node_address if pod.pod is None or pod.pod.status is not None else None
+    )
+    if not node_address:
+        raise HTTPException(status_code=503, detail=f"Target {pod.pod_name} has no address")
+    host = f"[{node_address}]" if ":" in node_address else node_address
     return pod.pod_name, f"http://{host}:{port if port is not None else target.port}{path}"
 
 
