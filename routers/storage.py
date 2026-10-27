@@ -1,4 +1,4 @@
-"""Logos Storage uploads and background downloads, controlled by the experiment."""
+"""Logos Storage uploads and control requests to per-pod stream verifiers."""
 
 import asyncio
 import hashlib
@@ -6,51 +6,47 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Annotated, Awaitable, Callable, Literal, Union
-from urllib.parse import quote
+from typing import Annotated, Awaitable, Callable, Union
 
 import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes.client.exceptions import ApiException
-from pydantic import BaseModel, Field, PositiveInt, field_validator
+from pydantic import BaseModel, Field, PositiveInt
 from urllib3.exceptions import HTTPError
 
 from common import get_pod_infos
 from routers.deps import TargetConfig, TargetName, unwrap_arg
+from routers.storage_verifier import (
+    CHUNK_SIZE,
+    MAX_CID_BYTES,
+    MAX_ERROR_BYTES,
+    VERIFIER_PORT,
+    DownloadReceipt,
+    DownloadSpec,
+    check_status as _check_status,
+)
 from schemas import NotFoundError
 
-CHUNK_SIZE = 64 * 1024
-MAX_CID_BYTES = 2048
-MAX_ERROR_BYTES = 4096
 MAX_JSON_BYTES = 64 * 1024
 MAX_CONCURRENT_OPERATIONS = 8
+StorageTarget = Annotated[Union[TargetName, TargetConfig], Field(discriminator="kind")]
 
 
 class StorageRequest(BaseModel):
-    target: Annotated[Union[TargetName, TargetConfig], Field(discriminator="kind")]
-    timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    target: StorageTarget
+    timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
 
 
 class UploadRequest(StorageRequest):
     file_size_bytes: PositiveInt = 1024 * 1024
 
 
-class DownloadRequest(StorageRequest):
-    cid: str = Field(min_length=1, max_length=MAX_CID_BYTES)
-    expected_size_bytes: PositiveInt
-    transport: Literal["direct", "mix"] = "direct"
-    poll_interval_seconds: float = Field(default=1, gt=0, allow_inf_nan=False)
-
-    @field_validator("cid")
-    @classmethod
-    def strip_cid(cls, value):
-        value = value.strip()
-        if not value:
-            raise ValueError("CID cannot be blank")
-        return value
+class DownloadRequest(DownloadSpec):
+    target: StorageTarget
+    verifier_port: int = Field(default=VERIFIER_PORT, ge=1, le=65535)
 
 
-async def _resolve_target(data, request, config):
+async def _resolve_target(data, request, config, *, port=None, path="/api/storage/v1/data"):
     target = unwrap_arg(data.target, "targets", config)
     if not 1 <= target.port <= 65535:
         raise HTTPException(status_code=422, detail="Target port must be between 1 and 65535")
@@ -72,21 +68,7 @@ async def _resolve_target(data, request, config):
     if not pod_ip:
         raise HTTPException(status_code=503, detail=f"Pod {pod.pod_name} has no IP")
     host = f"[{pod_ip}]" if ":" in pod_ip else pod_ip
-    return pod.pod_name, f"http://{host}:{target.port}/api/storage/v1/data"
-
-
-async def _check_status(response):
-    if response.status != 200:
-        # Bound diagnostic bodies too: the node may return arbitrary content.
-        body = await response.content.read(MAX_ERROR_BYTES)
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Storage node returned an error",
-                "upstream_status_code": response.status,
-                "body": body.decode("utf-8", errors="replace"),
-            },
-        )
+    return pod.pod_name, f"http://{host}:{port if port is not None else target.port}{path}"
 
 
 async def _upload(session, url, data):
@@ -132,119 +114,82 @@ async def _upload(session, url, data):
 
 
 async def _read_json(response):
-    await _check_status(response)
     body = bytearray()
     async for chunk in response.content.iter_chunked(CHUNK_SIZE):
         body.extend(chunk)
         if len(body) > MAX_JSON_BYTES:
-            raise HTTPException(status_code=502, detail="Storage node returned oversized JSON")
+            raise HTTPException(status_code=502, detail="Verifier returned oversized JSON")
+    if response.status != 200:
+        # Preserve Storage's original status across the verifier hop for retry policy.
+        try:
+            error = json.loads(body)
+        except ValueError:
+            error = None
+        detail = error.get("detail") if isinstance(error, dict) else None
+        if (
+            response.status == 502
+            and isinstance(detail, dict)
+            and type(detail.get("upstream_status_code")) is int
+        ):
+            raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Verifier returned an error",
+                "upstream_status_code": response.status,
+                "body": body[:MAX_ERROR_BYTES].decode("utf-8", errors="replace"),
+            },
+        )
     try:
         result = json.loads(body)
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Storage node returned invalid JSON") from exc
+        raise HTTPException(status_code=502, detail="Verifier returned invalid JSON") from exc
     if not isinstance(result, dict):
-        raise HTTPException(status_code=502, detail="Storage node returned a non-object JSON value")
+        raise HTTPException(status_code=502, detail="Verifier returned a non-object JSON value")
     return result
 
 
-async def _cancel_download(session, url):
-    # Cancellation is best effort and has its own small budget after the operation expires.
+async def _download(session, url, data, *, remaining):
+    # This connection carries only JSON. File contents stay in the receiving pod.
+    spec = DownloadSpec.model_validate(data.model_dump()).model_dump()
+    spec["timeout_seconds"] = remaining
+    async with session.post(url, json=spec, allow_redirects=False) as response:
+        payload = await _read_json(response)
     try:
-        async with asyncio.timeout(2):
-            async with session.delete(url, allow_redirects=False) as response:
-                await response.content.read(MAX_ERROR_BYTES)
-    except (Exception, asyncio.CancelledError):
-        pass
-
-
-async def _download(session, url, data):
-    started = time.perf_counter()
-    async with session.post(
-        url, params={"transport": data.transport}, allow_redirects=False
-    ) as response:
-        download = await _read_json(response)
-
-    manifest = download.get("manifest")
-    download_id = download.get("downloadId")
-    tree_cid = manifest.get("treeCid") if isinstance(manifest, dict) else None
+        receipt = DownloadReceipt.model_validate(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Verifier returned an invalid receipt") from exc
     if (
-        type(download_id) is not int
-        or download_id < 1
-        or not isinstance(tree_cid, str)
-        or not tree_cid.strip()
-        or len(tree_cid) > MAX_CID_BYTES
+        receipt.cid != data.cid
+        or receipt.sha256 != data.expected_sha256
+        or receipt.file_size_bytes != data.expected_size_bytes
+        or receipt.transport != data.transport
     ):
-        raise HTTPException(
-            status_code=502, detail="Storage node returned an invalid download ID or tree CID"
-        )
-
-    # The current Storage engine indexes active downloads by the manifest's tree CID.
-    # Polling with the manifest CID would incorrectly report inactive immediately.
-    data_url = url.rsplit("/", 2)[0]
-    job_url = f"{data_url}/{quote(tree_cid, safe='')}/network"
-    progress_url = f"{job_url}/progress/{download_id}"
-    cancel_url = f"{job_url}/{download_id}"
-    polls = 0
-    last_active_progress = None
-    try:
-        if download.get("cid") != data.cid:
-            raise HTTPException(status_code=502, detail="Storage node returned a different CID")
-        dataset_size = manifest.get("datasetSize")
-        if type(dataset_size) is not int or dataset_size != data.expected_size_bytes:
-            raise HTTPException(
-                status_code=409, detail="Manifest size does not match the expected size"
-            )
-        while True:
-            async with session.get(progress_url, allow_redirects=False) as response:
-                progress = await _read_json(response)
-            polls += 1
-            active = progress.get("active")
-            if active is False:
-                # The API removes finished jobs and has no terminal success/error status.
-                # Inactivity is observable here; payload integrity is deliberately unverified.
-                return {
-                    "cid": data.cid,
-                    "tree_cid": tree_cid,
-                    "download_id": download_id,
-                    "dataset_size_bytes": dataset_size,
-                    "seconds": time.perf_counter() - started,
-                    "progress_polls": polls,
-                    "last_active_progress": last_active_progress,
-                    "completion": "inactive",
-                    "verified": False,
-                }
-            if active is not True:
-                raise HTTPException(
-                    status_code=502, detail="Storage progress is missing a boolean active flag"
-                )
-            if any(
-                type(progress.get(key)) is not int or progress[key] < 0
-                for key in ("received", "total", "bytes")
-            ):
-                raise HTTPException(
-                    status_code=502, detail="Storage node returned invalid progress counters"
-                )
-            if progress["received"] > progress["total"]:
-                raise HTTPException(
-                    status_code=502, detail="Storage progress exceeds its total block count"
-                )
-            last_active_progress = progress
-            await asyncio.sleep(data.poll_interval_seconds)
-    except (Exception, asyncio.CancelledError):
-        await _cancel_download(session, cancel_url)
-        raise
+        raise HTTPException(status_code=409, detail="Verifier receipt does not match the requested file")
+    return receipt.model_dump()
 
 
 async def _run_operation(operation, request, data, config):
     try:
-        # Includes capacity wait, pod lookup, and the complete HTTP exchange.
+        deadline = asyncio.get_running_loop().time() + data.timeout_seconds
+        # Includes capacity wait, pod lookup, verifier queue, and the complete stream.
         async with asyncio.timeout(data.timeout_seconds):
             async with request.app.state.storage_semaphore:
-                pod_name, url = await _resolve_target(data, request, config)
+                kwargs = (
+                    {"port": data.verifier_port, "path": "/download"}
+                    if operation == "download"
+                    else {}
+                )
+                pod_name, url = await _resolve_target(data, request, config, **kwargs)
                 if operation == "download":
-                    url += f"/{quote(data.cid, safe='')}/network"
-                handler = _upload if operation == "upload" else _download
-                receipt = await handler(request.app.state.storage_session, url, data)
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    receipt = await _download(
+                        request.app.state.storage_session, url, data, remaining=remaining
+                    )
+                else:
+                    receipt = await _upload(request.app.state.storage_session, url, data)
                 return {
                     "request": {"operation": operation, "pod": pod_name, "url": url},
                     "response": {"status_code": 200, "text": json.dumps(receipt)},
