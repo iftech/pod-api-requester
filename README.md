@@ -77,6 +77,9 @@ Each request selects exactly one pod using an existing named or inline target.
 Use an anchored `name_template`, such as `^storage-nodes-0$`, and set the target's
 `port` to the Storage API port (normally 8080).
 No matching pod returns 404; multiple matches return 409.
+Static targets are also supported: set `hosts` to a list with one hostname or IP
+address instead of Kubernetes filters. Uploads use that address at the target's `port`;
+downloads contact a verifier at the same address and `verifier_port`.
 
 Upload a random file with:
 
@@ -96,6 +99,10 @@ The coordinator generates 64 KiB chunks, computes SHA-256, and streams them to
 contains `response.text`, a JSON receipt with `cid`, `sha256`,
 `file_size_bytes`, and `seconds`. The payload is not saved to a file or returned
 to the experiment runner. The default file size is 1 MiB.
+Uploads are limited to 100 MiB by default. Set `STORAGE_MAX_UPLOAD_SIZE_BYTES`
+in the coordinator's environment before startup to change the limit (in bytes,
+at least 1048576 to preserve the 1 MiB default). Larger `file_size_bytes` values
+return HTTP 422 validation errors before any target lookup or upload.
 
 Pass the upload's CID, hash, and size to a different receiver:
 
